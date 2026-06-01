@@ -6,6 +6,8 @@ Account and transaction updates are fanned out from a single sender to local
 consumers over a per-consumer SPSC ring in `/dev/shm`, with a Unix-domain
 control socket for handshake, subscription, and eventfd-based wakeups.
 
+![qlaster](./image.png)
+
 ## Why
 
 - **Zero-copy hot path.** Updates land in mmap'd ring memory; consumers read in
