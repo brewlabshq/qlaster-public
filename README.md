@@ -54,6 +54,20 @@ opt-in, reconnection).
 
 ## Requirements
 
-Linux only — depends on `eventfd(2)`, `memfd_create`, and `SCM_RIGHTS` over
-Unix sockets. Sender and consumer must share a host (and the `/dev/shm`
-directory the sender chooses).
+Unix. Linux is the production target; macOS is supported for development.
+
+- **Inter-process wakeups** use `eventfd(2)` on Linux and a self-pipe on macOS
+  (the sender holds the write end and hands the consumer the read end). Both
+  are passed over `SCM_RIGHTS`.
+- **The shared-memory ring** is a regular `mmap(MAP_SHARED)` file — there is no
+  `memfd_create` dependency. On Linux the default directory is the RAM-backed
+  `/dev/shm`; on macOS it falls back to the platform temp dir
+  (`std::env::temp_dir()`), which is APFS-backed, so ring latency on macOS is
+  not representative of production.
+- **SIGPIPE** is suppressed per-send via `MSG_NOSIGNAL` on Linux and via the
+  `SO_NOSIGPIPE` socket option on macOS.
+
+Sender and consumer must run on the same host and share the shared-memory
+directory the sender chooses.
+
+Build: edition 2024 (Rust 1.85+).

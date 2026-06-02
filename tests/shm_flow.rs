@@ -28,7 +28,7 @@ fn shm_config(label: &str) -> ShmTransportConfig {
     ShmTransportConfig {
         uds_path,
         shm_dir,
-        ring_capacity_bytes: 1 * 1024 * 1024, // 1 MiB is plenty for tests
+        ring_capacity_bytes: 1024 * 1024, // 1 MiB is plenty for tests
     }
 }
 

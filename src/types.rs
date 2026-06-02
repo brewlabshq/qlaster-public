@@ -599,7 +599,7 @@ impl AccountUpdate {
             }
             Bytes::copy_from_slice(wire_payload)
         };
-        Ok(Self::from_decoded(decoded, payload)?)
+        Self::from_decoded(decoded, payload)
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, QlasterError> {
@@ -633,7 +633,7 @@ impl AccountUpdate {
             }
             wire_payload
         };
-        Ok(Self::from_decoded(decoded, payload)?)
+        Self::from_decoded(decoded, payload)
     }
 
     pub fn decode_owned(bytes: Vec<u8>) -> Result<Self, QlasterError> {
@@ -1085,7 +1085,9 @@ mod tests {
     #[test]
     fn connection_ready_shm_roundtrip() {
         let token = SlotToken::new(3, 7);
-        let ready = ConnectionReadyShm::new(token, "/dev/shm/qlaster/test".into(), 64 * 1024);
+        // Path is only encode/decode round-tripped here (no filesystem access);
+        // use a portable string rather than a Linux-only /dev/shm path.
+        let ready = ConnectionReadyShm::new(token, "qlaster/test-ring".into(), 64 * 1024);
         let bytes = ready.encode();
         assert_eq!(
             ConnectionReadyShm::decode(&bytes).expect("decode shm ready"),
