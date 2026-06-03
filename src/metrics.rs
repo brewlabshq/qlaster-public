@@ -74,11 +74,7 @@ pub struct LatencySnapshot {
 
 impl LatencySnapshot {
     pub fn avg_us(&self) -> u64 {
-        if self.count == 0 {
-            0
-        } else {
-            self.total_us / self.count
-        }
+        self.total_us.checked_div(self.count).unwrap_or(0)
     }
 }
 

@@ -1171,7 +1171,9 @@ mod tests {
     #[test]
     fn connection_ready_shm_roundtrip() {
         let token = SlotToken::new(3, 7);
-        let ready = ConnectionReadyShm::new(token, "/dev/shm/qlaster/test".into(), 64 * 1024);
+        // Path is only encode/decode round-tripped here (no filesystem access);
+        // use a portable string rather than a Linux-only /dev/shm path.
+        let ready = ConnectionReadyShm::new(token, "qlaster/test-ring".into(), 64 * 1024);
         let bytes = ready.encode();
         assert_eq!(
             ConnectionReadyShm::decode(&bytes).expect("decode shm ready"),

@@ -51,9 +51,16 @@ pub struct ShmTransportConfig {
 
 impl ShmTransportConfig {
     pub fn defaults(uds_path: impl Into<PathBuf>) -> Self {
+        // Linux keeps the RAM-backed tmpfs at /dev/shm. macOS (and other
+        // unixes) have no /dev/shm, so fall back to the platform temp dir;
+        // the ring is a regular mmap'd file, so any shared directory works.
+        #[cfg(target_os = "linux")]
+        let shm_dir = PathBuf::from(format!("/dev/shm/qlaster-{}", std::process::id()));
+        #[cfg(not(target_os = "linux"))]
+        let shm_dir = std::env::temp_dir().join(format!("qlaster-{}", std::process::id()));
         Self {
             uds_path: uds_path.into(),
-            shm_dir: PathBuf::from(format!("/dev/shm/qlaster-{}", std::process::id())),
+            shm_dir,
             ring_capacity_bytes: DEFAULT_SHM_RING_CAPACITY,
         }
     }

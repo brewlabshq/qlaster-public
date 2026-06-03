@@ -62,6 +62,12 @@ pub(crate) async fn run_listener(
             .accept()
             .await
             .map_err(|e| QlasterError::UdsError(format!("accept: {e}")))?;
+        if let Err(err) = crate::shm::set_nosigpipe(stream.as_raw_fd()) {
+            // Refuse to serve a connection we cannot protect from SIGPIPE; a
+            // later write to a vanished peer could otherwise kill the process.
+            tracing::error!("dropping connection: set SO_NOSIGPIPE failed: {err}");
+            continue;
+        }
         let state = Arc::clone(&state);
         let config = config.clone();
         tokio::spawn(async move {
@@ -107,7 +113,10 @@ async fn handle_uds_connection(
                             ring_capacity,
                         );
                         let encoded = ready.encode();
-                        let raw_fd = eventfd.as_raw_fd();
+                        // Hand the consumer the *passable* fd: the single
+                        // eventfd on Linux, the pipe read end on macOS (the
+                        // producer keeps the write end for notify()).
+                        let raw_fd = eventfd.pass_fd();
                         send_frame_with_fd(&stream, &encoded, raw_fd).await?;
                         // Drop our temporary handshake-side Arc; the SlotSink
                         // installed in upsert_shm keeps the eventfd alive.

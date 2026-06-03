@@ -1,6 +1,7 @@
 //! SHM-transport consumer. Uses a UDS control channel and an mmap'd ring for
 //! the data plane.
 
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
@@ -64,6 +65,8 @@ pub async fn setup_shm_consumer_with_metrics(
     let mut stream = UnixStream::connect(uds_path.as_ref())
         .await
         .map_err(|e| QlasterError::UdsError(format!("connect: {e}")))?;
+    crate::shm::set_nosigpipe(stream.as_raw_fd())
+        .map_err(|e| QlasterError::UdsError(format!("set SO_NOSIGPIPE: {e}")))?;
 
     // Bootstrap subscribe: empty filter, no slot token. Triggers slot creation
     // on the sender and the SCM_RIGHTS ConnectionReadyShm reply.
