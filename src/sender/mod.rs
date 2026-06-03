@@ -1,8 +1,8 @@
 use std::{
     collections::HashSet,
     path::PathBuf,
-    sync::Arc,
     sync::atomic::{AtomicU64, Ordering},
+    sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -12,7 +12,7 @@ use tokio::sync::{broadcast, mpsc};
 
 use crate::{
     error::QlasterError,
-    metrics::{QlasterSenderMetrics, unix_time_nanos},
+    metrics::{unix_time_nanos, QlasterSenderMetrics},
     shm::{EventFd, ShmRingProducer},
     transport::{OutboundFrame, SlotSink},
     types::{
@@ -746,8 +746,6 @@ mod tests {
 
         assert!(filter.account_pubkeys.is_empty());
         assert!(filter.account_owners.is_empty());
-        assert!(
-            !filter.matches_account(&sample_update(Pubkey::new_unique(), Pubkey::new_unique()))
-        );
+        assert!(!filter.matches_account(&sample_update(Pubkey::new_unique(), Pubkey::new_unique())));
     }
 }

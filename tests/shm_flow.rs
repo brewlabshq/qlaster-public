@@ -5,8 +5,8 @@ use std::time::{Duration, Instant};
 use qlaster::consumer::setup_shm_consumer;
 use qlaster::metrics::QlasterSenderMetrics;
 use qlaster::sender::{
-    SenderConfig, ShmTransportConfig, setup_sender, setup_sender_with_streams,
-    setup_sender_with_transactions,
+    setup_sender, setup_sender_with_streams, setup_sender_with_transactions, SenderConfig,
+    ShmTransportConfig,
 };
 use qlaster::types::{
     AccountPayload, AccountUpdate, SlotUpdate, TransactionPayload, TransactionUpdate,
@@ -33,6 +33,10 @@ fn shm_config(label: &str) -> ShmTransportConfig {
         shm_dir,
         ring_capacity_bytes: 1024 * 1024, // 1 MiB is plenty for tests
     }
+}
+
+fn test_pubkey(seed: u8) -> Pubkey {
+    Pubkey::new_from_array([seed; 32])
 }
 
 async fn drain_one_update<F>(poll: F, timeout: Duration) -> Option<AccountUpdate>
@@ -115,8 +119,8 @@ async fn shm_end_to_end_filter_and_delivery() {
     assert!(boot_req.account_pubkeys.is_empty());
     assert!(boot_req.account_owners.is_empty());
 
-    let pk = Pubkey::new_unique();
-    let owner = Pubkey::new_unique();
+    let pk = test_pubkey(1);
+    let owner = test_pubkey(2);
     consumer
         .subscribe(vec![pk], vec![owner])
         .await
@@ -130,8 +134,8 @@ async fn shm_end_to_end_filter_and_delivery() {
     assert_eq!(sub_req.account_pubkeys, vec![pk]);
     assert_eq!(sub_req.account_owners, vec![owner]);
 
-    let other_pk = Pubkey::new_unique();
-    let other_owner = Pubkey::new_unique();
+    let other_pk = test_pubkey(3);
+    let other_owner = test_pubkey(4);
 
     // Non-matching update — should not appear at the consumer.
     let _ = updates_tx.send(AccountUpdate {
@@ -363,9 +367,9 @@ async fn multiple_shm_consumers_get_disjoint_filters() {
     let mut a = setup_shm_consumer(&uds_path).await.expect("setup a");
     let mut b = setup_shm_consumer(&uds_path).await.expect("setup b");
 
-    let pk_a = Pubkey::new_unique();
-    let pk_b = Pubkey::new_unique();
-    let dummy_owner = Pubkey::new_unique();
+    let pk_a = test_pubkey(5);
+    let pk_b = test_pubkey(6);
+    let dummy_owner = test_pubkey(7);
 
     a.subscribe(vec![pk_a], vec![]).await.expect("a sub");
     b.subscribe(vec![pk_b], vec![]).await.expect("b sub");

@@ -4,8 +4,8 @@
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::{
+    atomic::{AtomicU64, AtomicU8, Ordering},
     Arc,
-    atomic::{AtomicU8, AtomicU64, Ordering},
 };
 use std::time::Instant;
 
@@ -15,12 +15,12 @@ use tokio::sync::Mutex;
 
 use crate::{
     error::QlasterError,
-    metrics::{QlasterConsumerMetrics, elapsed_since_unix_time_nanos_us},
-    shm::{AsyncEventFd, EventFd, ShmRingConsumer, recv_frame_with_fd},
+    metrics::{elapsed_since_unix_time_nanos_us, QlasterConsumerMetrics},
+    shm::{recv_frame_with_fd, AsyncEventFd, EventFd, ShmRingConsumer},
     types::{
+        decode_server_frame, decode_server_frame_owned, decode_server_frame_owned_with_meta,
         AccountUpdate, ConnectionReady, PingRequest, ServerFrame, ServerFrameWithMeta, SlotToken,
-        SlotUpdate, SubscriptionRequest, TransactionUpdate, decode_server_frame,
-        decode_server_frame_owned, decode_server_frame_owned_with_meta,
+        SlotUpdate, SubscriptionRequest, TransactionUpdate,
     },
     wire::{read_framed, write_framed},
 };
