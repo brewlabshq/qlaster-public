@@ -10,7 +10,8 @@ const READY_TAG: u8 = 3; // sender -> client control frame carrying assigned slo
 const REQUEST_PING_TAG: u8 = 4; // keepalive ping sent from client to sender
 const READY_SHM_TAG: u8 = 5; // sender -> client SHM ring handshake (UDS-only)
 const TRANSACTION_UPDATE_TAG: u8 = 6; // transaction update sent from sender to client
-const WIRE_VERSION: u8 = 8; // allows safe protocol evolution with explicit version checks
+const SLOT_UPDATE_TAG: u8 = 7; // Solana slot update sent from sender to client
+const WIRE_VERSION: u8 = 9; // allows safe protocol evolution with explicit version checks
 const UNSET_SLOT_INDEX: u8 = u8::MAX;
 pub const MAX_ACCOUNT_PAYLOAD_BYTES: usize = 10 * 1024 * 1024; // solana account data upper bound
 pub const MAX_TRANSACTION_PAYLOAD_BYTES: usize = 10 * 1024 * 1024;
@@ -20,6 +21,7 @@ const ACCOUNT_UPDATE_COMPRESSION_SAMPLE_BYTES: usize = 8 * 1024;
 const ACCOUNT_UPDATE_COMPRESSION_MIN_GAIN_BPS: usize = 75;
 const ACCOUNT_UPDATE_FIXED_BYTES: usize = 2 + 8 + (32 * 2) + (8 * 4) + 1 + 1 + 4 + 4;
 const TRANSACTION_UPDATE_FIXED_BYTES: usize = 2 + 8 + 8 + 4 + 1 + 64 + 4;
+const SLOT_UPDATE_FIXED_BYTES: usize = 2 + 8 + 8;
 
 fn should_attempt_lz4(payload: &[u8]) -> bool {
     // Never attempt compression below threshold; small payloads are faster uncompressed.
@@ -89,7 +91,6 @@ impl SlotToken {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SubscriptionRequest {
-    pub client_recv_port: u16,
     pub slot_token: Option<SlotToken>,
     pub account_pubkeys: Vec<Pubkey>,
     pub account_owners: Vec<Pubkey>,
@@ -97,13 +98,8 @@ pub struct SubscriptionRequest {
 }
 
 impl SubscriptionRequest {
-    pub fn new(
-        client_recv_port: u16,
-        account_pubkeys: Vec<Pubkey>,
-        account_owners: Vec<Pubkey>,
-    ) -> Self {
+    pub fn new(account_pubkeys: Vec<Pubkey>, account_owners: Vec<Pubkey>) -> Self {
         Self {
-            client_recv_port,
             slot_token: None,
             account_pubkeys,
             account_owners,
@@ -111,9 +107,8 @@ impl SubscriptionRequest {
         }
     }
 
-    pub fn transactions(client_recv_port: u16) -> Self {
+    pub fn transactions() -> Self {
         Self {
-            client_recv_port,
             slot_token: None,
             account_pubkeys: Vec::new(),
             account_owners: Vec::new(),
@@ -140,7 +135,6 @@ impl SubscriptionRequest {
         let wire = WireSubscriptionRequest {
             wire_version: WIRE_VERSION,
             message_tag: REQUEST_SUBSCRIBE_TAG,
-            client_recv_port: self.client_recv_port,
             slot_index,
             slot_generation,
             account_pubkeys: self.account_pubkeys.iter().map(|k| k.to_bytes()).collect(),
@@ -159,7 +153,6 @@ impl SubscriptionRequest {
             .then_some(SlotToken::new(wire.slot_index, wire.slot_generation));
 
         Ok(Self {
-            client_recv_port: wire.client_recv_port,
             slot_token,
             account_pubkeys: wire
                 .account_pubkeys
@@ -178,23 +171,18 @@ impl SubscriptionRequest {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PingRequest {
-    pub client_recv_port: u16,
     pub slot_token: SlotToken,
 }
 
 impl PingRequest {
-    pub fn new(client_recv_port: u16, slot_token: SlotToken) -> Self {
-        Self {
-            client_recv_port,
-            slot_token,
-        }
+    pub fn new(slot_token: SlotToken) -> Self {
+        Self { slot_token }
     }
 
     pub fn encode(&self) -> Vec<u8> {
         let wire = WirePingRequest {
             wire_version: WIRE_VERSION,
             message_tag: REQUEST_PING_TAG,
-            client_recv_port: self.client_recv_port,
             slot_index: self.slot_token.slot_index,
             slot_generation: self.slot_token.generation,
         };
@@ -211,7 +199,6 @@ impl PingRequest {
         }
 
         Ok(Self {
-            client_recv_port: wire.client_recv_port,
             slot_token: SlotToken::new(wire.slot_index, wire.slot_generation),
         })
     }
@@ -320,6 +307,7 @@ pub enum ClientFrame {
 pub enum ServerFrame {
     AccountUpdate(AccountUpdate),
     TransactionUpdate(TransactionUpdate),
+    SlotUpdate(SlotUpdate),
     ConnectionReady(ConnectionReady),
     ConnectionReadyShm(ConnectionReadyShm),
 }
@@ -337,6 +325,10 @@ pub enum ServerFrameWithMeta {
     },
     TransactionUpdate {
         update: TransactionUpdate,
+        meta: AccountUpdateWireMeta,
+    },
+    SlotUpdate {
+        update: SlotUpdate,
         meta: AccountUpdateWireMeta,
     },
     ConnectionReady(ConnectionReady),
@@ -366,6 +358,7 @@ pub fn decode_server_frame(bytes: &[u8]) -> Result<ServerFrame, QlasterError> {
         TRANSACTION_UPDATE_TAG => {
             TransactionUpdate::decode(bytes).map(ServerFrame::TransactionUpdate)
         }
+        SLOT_UPDATE_TAG => SlotUpdate::decode(bytes).map(ServerFrame::SlotUpdate),
         READY_TAG => ConnectionReady::decode(bytes).map(ServerFrame::ConnectionReady),
         READY_SHM_TAG => ConnectionReadyShm::decode(bytes).map(ServerFrame::ConnectionReadyShm),
         found => Err(QlasterError::InvalidMessageTag {
@@ -381,6 +374,7 @@ pub fn decode_server_frame_owned(bytes: Vec<u8>) -> Result<ServerFrame, QlasterE
         TRANSACTION_UPDATE_TAG => {
             TransactionUpdate::decode_owned(bytes).map(ServerFrame::TransactionUpdate)
         }
+        SLOT_UPDATE_TAG => SlotUpdate::decode_owned(bytes).map(ServerFrame::SlotUpdate),
         READY_TAG => ConnectionReady::decode(&bytes).map(ServerFrame::ConnectionReady),
         READY_SHM_TAG => ConnectionReadyShm::decode(&bytes).map(ServerFrame::ConnectionReadyShm),
         found => Err(QlasterError::InvalidMessageTag {
@@ -401,6 +395,10 @@ pub fn decode_server_frame_owned_with_meta(
         TRANSACTION_UPDATE_TAG => {
             let (update, meta) = TransactionUpdate::decode_owned_with_meta(bytes)?;
             Ok(ServerFrameWithMeta::TransactionUpdate { update, meta })
+        }
+        SLOT_UPDATE_TAG => {
+            let (update, meta) = SlotUpdate::decode_owned_with_meta(bytes)?;
+            Ok(ServerFrameWithMeta::SlotUpdate { update, meta })
         }
         READY_TAG => ConnectionReady::decode(&bytes).map(ServerFrameWithMeta::ConnectionReady),
         READY_SHM_TAG => {
@@ -599,7 +597,7 @@ impl AccountUpdate {
             }
             Bytes::copy_from_slice(wire_payload)
         };
-        Ok(Self::from_decoded(decoded, payload)?)
+        Self::from_decoded(decoded, payload)
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, QlasterError> {
@@ -633,7 +631,7 @@ impl AccountUpdate {
             }
             wire_payload
         };
-        Ok(Self::from_decoded(decoded, payload)?)
+        Self::from_decoded(decoded, payload)
     }
 
     pub fn decode_owned(bytes: Vec<u8>) -> Result<Self, QlasterError> {
@@ -713,6 +711,65 @@ impl TryFrom<Bytes> for TransactionPayload {
 impl AsRef<[u8]> for TransactionPayload {
     fn as_ref(&self) -> &[u8] {
         self.as_slice()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SlotUpdate {
+    pub slot: u64,
+}
+
+impl SlotUpdate {
+    pub fn new(slot: u64) -> Self {
+        Self { slot }
+    }
+
+    pub fn encode_parts_at(
+        &self,
+        sender_created_at_unix_nanos: u64,
+    ) -> Result<(Bytes, Bytes), QlasterError> {
+        let mut header = Vec::with_capacity(SLOT_UPDATE_FIXED_BYTES);
+        header.push(WIRE_VERSION);
+        header.push(SLOT_UPDATE_TAG);
+        header.extend_from_slice(&sender_created_at_unix_nanos.to_le_bytes());
+        header.extend_from_slice(&self.slot.to_le_bytes());
+        Ok((Bytes::from(header), Bytes::new()))
+    }
+
+    pub fn encode_parts(&self) -> Result<(Bytes, Bytes), QlasterError> {
+        self.encode_parts_at(unix_time_nanos())
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>, QlasterError> {
+        let (header, payload) = self.encode_parts()?;
+        let mut out = Vec::with_capacity(header.len() + payload.len());
+        out.extend_from_slice(&header);
+        out.extend_from_slice(&payload);
+        Ok(out)
+    }
+
+    pub fn decode_with_meta(bytes: &[u8]) -> Result<(Self, AccountUpdateWireMeta), QlasterError> {
+        let decoded = DecodedSlotUpdate::parse(bytes)?;
+        Ok((
+            Self { slot: decoded.slot },
+            AccountUpdateWireMeta {
+                sender_created_at_unix_nanos: decoded.sender_created_at_unix_nanos,
+            },
+        ))
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, QlasterError> {
+        Self::decode_with_meta(bytes).map(|(update, _)| update)
+    }
+
+    pub fn decode_owned_with_meta(
+        bytes: Vec<u8>,
+    ) -> Result<(Self, AccountUpdateWireMeta), QlasterError> {
+        Self::decode_with_meta(&bytes)
+    }
+
+    pub fn decode_owned(bytes: Vec<u8>) -> Result<Self, QlasterError> {
+        Self::decode_owned_with_meta(bytes).map(|(update, _)| update)
     }
 }
 
@@ -972,6 +1029,38 @@ impl DecodedTransactionUpdate {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct DecodedSlotUpdate {
+    sender_created_at_unix_nanos: u64,
+    slot: u64,
+}
+
+impl DecodedSlotUpdate {
+    fn parse(bytes: &[u8]) -> Result<Self, QlasterError> {
+        if bytes.len() < SLOT_UPDATE_FIXED_BYTES {
+            return Err(QlasterError::MalformedPayload(
+                "slot update frame shorter than fixed header",
+            ));
+        }
+
+        ensure_wire(bytes[0], bytes[1], SLOT_UPDATE_TAG)?;
+
+        let mut cursor = 2usize;
+        let sender_created_at_unix_nanos = take_u64_le(bytes, &mut cursor)?;
+        let slot = take_u64_le(bytes, &mut cursor)?;
+        if bytes.len() != cursor {
+            return Err(QlasterError::MalformedPayload(
+                "slot update payload size mismatch",
+            ));
+        }
+
+        Ok(Self {
+            sender_created_at_unix_nanos,
+            slot,
+        })
+    }
+}
+
 fn take_exact<'a>(
     bytes: &'a [u8],
     cursor: &mut usize,
@@ -1027,7 +1116,6 @@ fn take_array_64(bytes: &[u8], cursor: &mut usize) -> Result<[u8; 64], QlasterEr
 struct WireSubscriptionRequest {
     wire_version: u8,
     message_tag: u8,
-    client_recv_port: u16,
     slot_index: u8,
     slot_generation: u64,
     account_pubkeys: Vec<[u8; 32]>,
@@ -1039,7 +1127,6 @@ struct WireSubscriptionRequest {
 struct WirePingRequest {
     wire_version: u8,
     message_tag: u8,
-    client_recv_port: u16,
     slot_index: u8,
     slot_generation: u64,
 }
@@ -1070,7 +1157,6 @@ mod tests {
     #[test]
     fn subscription_request_roundtrip() {
         let req = SubscriptionRequest::new(
-            9010,
             vec![Pubkey::new_unique(), Pubkey::new_unique()],
             vec![Pubkey::new_unique()],
         )
@@ -1112,7 +1198,7 @@ mod tests {
     #[test]
     fn ping_and_ready_roundtrip() {
         let token = SlotToken::new(1, 99);
-        let ping = PingRequest::new(9010, token);
+        let ping = PingRequest::new(token);
         assert_eq!(
             PingRequest::decode(&ping.encode()).expect("decode ping"),
             ping
@@ -1200,14 +1286,40 @@ mod tests {
     }
 
     #[test]
+    fn slot_update_roundtrip_and_metadata() {
+        let update = SlotUpdate::new(456);
+        let sender_created_at_unix_nanos = 222_333_444;
+        let (header, payload) = update
+            .encode_parts_at(sender_created_at_unix_nanos)
+            .expect("encode slot");
+        assert!(payload.is_empty());
+        let mut bytes = Vec::with_capacity(header.len() + payload.len());
+        bytes.extend_from_slice(&header);
+        bytes.extend_from_slice(&payload);
+
+        let (decoded, meta) = SlotUpdate::decode_with_meta(&bytes).expect("decode slot");
+        assert_eq!(decoded, update);
+        assert_eq!(
+            meta.sender_created_at_unix_nanos,
+            sender_created_at_unix_nanos
+        );
+
+        let decoded_owned = SlotUpdate::decode_owned(bytes.clone()).expect("decode owned slot");
+        assert_eq!(decoded_owned, update);
+
+        let routed = decode_server_frame(&bytes).expect("route slot");
+        assert!(matches!(routed, ServerFrame::SlotUpdate(_)));
+    }
+
+    #[test]
     fn frame_decode_routes_by_tag() {
-        let sub = SubscriptionRequest::new(9010, vec![Pubkey::new_unique()], vec![]);
+        let sub = SubscriptionRequest::new(vec![Pubkey::new_unique()], vec![]);
         assert!(matches!(
             decode_client_frame(&sub.encode()).expect("decode client sub"),
             ClientFrame::Subscription(_)
         ));
 
-        let ping = PingRequest::new(9010, SlotToken::new(0, 1));
+        let ping = PingRequest::new(SlotToken::new(0, 1));
         assert!(matches!(
             decode_client_frame(&ping.encode()).expect("decode client ping"),
             ClientFrame::Ping(_)
@@ -1222,7 +1334,7 @@ mod tests {
 
     #[test]
     fn request_rejects_invalid_version_and_tag() {
-        let req = SubscriptionRequest::new(9010, vec![Pubkey::new_unique()], vec![]);
+        let req = SubscriptionRequest::new(vec![Pubkey::new_unique()], vec![]);
         let mut bytes = req.encode();
 
         bytes[0] = 99;
@@ -1280,7 +1392,7 @@ mod tests {
 
     #[test]
     fn decode_rejects_truncated_and_garbage_payloads() {
-        let req = SubscriptionRequest::new(9010, vec![Pubkey::new_unique()], vec![]);
+        let req = SubscriptionRequest::new(vec![Pubkey::new_unique()], vec![]);
         let mut bytes = req.encode();
         bytes.truncate(bytes.len() / 2);
         assert!(SubscriptionRequest::decode(&bytes).is_err());

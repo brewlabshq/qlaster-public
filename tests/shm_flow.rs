@@ -5,9 +5,12 @@ use std::time::{Duration, Instant};
 use qlaster::consumer::setup_shm_consumer;
 use qlaster::metrics::QlasterSenderMetrics;
 use qlaster::sender::{
-    SenderConfig, ShmTransportConfig, setup_sender, setup_sender_with_transactions,
+    SenderConfig, ShmTransportConfig, setup_sender, setup_sender_with_streams,
+    setup_sender_with_transactions,
 };
-use qlaster::types::{AccountPayload, AccountUpdate, TransactionPayload, TransactionUpdate};
+use qlaster::types::{
+    AccountPayload, AccountUpdate, SlotUpdate, TransactionPayload, TransactionUpdate,
+};
 use solana_pubkey::Pubkey;
 use tokio::sync::{broadcast, mpsc};
 
@@ -28,7 +31,7 @@ fn shm_config(label: &str) -> ShmTransportConfig {
     ShmTransportConfig {
         uds_path,
         shm_dir,
-        ring_capacity_bytes: 1 * 1024 * 1024, // 1 MiB is plenty for tests
+        ring_capacity_bytes: 1024 * 1024, // 1 MiB is plenty for tests
     }
 }
 
@@ -64,6 +67,22 @@ where
     }
 }
 
+async fn drain_one_slot<F>(poll: F, timeout: Duration) -> Option<SlotUpdate>
+where
+    F: Fn() -> Option<SlotUpdate>,
+{
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(update) = poll() {
+            return Some(update);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        tokio::task::yield_now().await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shm_end_to_end_filter_and_delivery() {
     let cfg = shm_config("basic");
@@ -83,7 +102,7 @@ async fn shm_end_to_end_filter_and_delivery() {
     .expect("setup sender");
     let _sender_task = tokio::spawn(sender.run());
 
-    let mut consumer = setup_shm_consumer(&uds_path, 9000)
+    let mut consumer = setup_shm_consumer(&uds_path)
         .await
         .expect("setup shm consumer");
 
@@ -208,7 +227,7 @@ async fn shm_transaction_stream_requires_subscription() {
     .expect("setup sender");
     let _sender_task = tokio::spawn(sender.run());
 
-    let mut consumer = setup_shm_consumer(&uds_path, 9100)
+    let mut consumer = setup_shm_consumer(&uds_path)
         .await
         .expect("setup shm consumer");
 
@@ -278,6 +297,52 @@ async fn shm_transaction_stream_requires_subscription() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shm_slot_stream_is_always_on() {
+    let cfg = shm_config("slots");
+    let uds_path = cfg.uds_path.clone();
+
+    let (updates_tx, _) = broadcast::channel::<AccountUpdate>(128);
+    let (slots_tx, _) = broadcast::channel::<SlotUpdate>(128);
+    let (bloom_tx, _bloom_rx) = mpsc::unbounded_channel();
+    let metrics = Arc::new(QlasterSenderMetrics::new());
+
+    let sender = setup_sender_with_streams(
+        SenderConfig { shm: cfg },
+        updates_tx.clone(),
+        None,
+        Some(slots_tx.clone()),
+        Some(bloom_tx),
+        Arc::clone(&metrics),
+    )
+    .await
+    .expect("setup sender");
+    let _sender_task = tokio::spawn(sender.run());
+
+    let consumer = setup_shm_consumer(&uds_path)
+        .await
+        .expect("setup shm consumer");
+
+    let slot_update = SlotUpdate::new(44);
+    let _ = slots_tx.send(slot_update);
+    let got = drain_one_slot(|| consumer.try_next_slot(), Duration::from_secs(3))
+        .await
+        .expect("slot timeout");
+
+    assert_eq!(got, slot_update);
+
+    let dispatch_snap = metrics.dispatch.flush();
+    let shm_send_snap = metrics.shm_send.flush();
+    assert!(
+        dispatch_snap.count >= 1,
+        "dispatch metric should fire on slot delivery, got {dispatch_snap:?}"
+    );
+    assert!(
+        shm_send_snap.count >= 1,
+        "shm_send metric should fire on slot delivery, got {shm_send_snap:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn multiple_shm_consumers_get_disjoint_filters() {
     let cfg = shm_config("multi");
     let uds_path = cfg.uds_path.clone();
@@ -295,8 +360,8 @@ async fn multiple_shm_consumers_get_disjoint_filters() {
     .expect("setup sender");
     let _sender_task = tokio::spawn(sender.run());
 
-    let mut a = setup_shm_consumer(&uds_path, 9201).await.expect("setup a");
-    let mut b = setup_shm_consumer(&uds_path, 9202).await.expect("setup b");
+    let mut a = setup_shm_consumer(&uds_path).await.expect("setup a");
+    let mut b = setup_shm_consumer(&uds_path).await.expect("setup b");
 
     let pk_a = Pubkey::new_unique();
     let pk_b = Pubkey::new_unique();

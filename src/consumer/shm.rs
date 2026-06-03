@@ -18,8 +18,8 @@ use crate::{
     shm::{AsyncEventFd, EventFd, ShmRingConsumer, recv_frame_with_fd},
     types::{
         AccountUpdate, ConnectionReady, PingRequest, ServerFrame, ServerFrameWithMeta, SlotToken,
-        SubscriptionRequest, TransactionUpdate, decode_server_frame, decode_server_frame_owned,
-        decode_server_frame_owned_with_meta,
+        SlotUpdate, SubscriptionRequest, TransactionUpdate, decode_server_frame,
+        decode_server_frame_owned, decode_server_frame_owned_with_meta,
     },
     wire::{read_framed, write_framed},
 };
@@ -30,11 +30,11 @@ const UNSET_SLOT_INDEX: u8 = u8::MAX;
 #[derive(Debug)]
 pub struct QlasterShmConsumer {
     stream: Arc<Mutex<UnixStream>>,
-    client_recv_port: u16,
     slot_token_index: Arc<AtomicU8>,
     slot_token_generation: Arc<AtomicU64>,
     pub updates: Arc<ArrayQueue<AccountUpdate>>,
     pub transactions: Arc<ArrayQueue<TransactionUpdate>>,
+    pub slots: Arc<ArrayQueue<SlotUpdate>>,
     metrics: Arc<QlasterConsumerMetrics>,
     reader_task: tokio::task::JoinHandle<()>,
     /// Held only to extend the ring's lifetime; reader_task has its own
@@ -53,19 +53,12 @@ impl Drop for QlasterShmConsumer {
 /// SCM_RIGHTS), open the per-slot ring, and start the reader task.
 pub async fn setup_shm_consumer(
     uds_path: impl AsRef<Path>,
-    client_recv_port: u16,
 ) -> Result<QlasterShmConsumer, QlasterError> {
-    setup_shm_consumer_with_metrics(
-        uds_path,
-        client_recv_port,
-        Arc::new(QlasterConsumerMetrics::new()),
-    )
-    .await
+    setup_shm_consumer_with_metrics(uds_path, Arc::new(QlasterConsumerMetrics::new())).await
 }
 
 pub async fn setup_shm_consumer_with_metrics(
     uds_path: impl AsRef<Path>,
-    client_recv_port: u16,
     metrics: Arc<QlasterConsumerMetrics>,
 ) -> Result<QlasterShmConsumer, QlasterError> {
     let mut stream = UnixStream::connect(uds_path.as_ref())
@@ -74,7 +67,7 @@ pub async fn setup_shm_consumer_with_metrics(
 
     // Bootstrap subscribe: empty filter, no slot token. Triggers slot creation
     // on the sender and the SCM_RIGHTS ConnectionReadyShm reply.
-    let bootstrap = SubscriptionRequest::new(client_recv_port, Vec::new(), Vec::new());
+    let bootstrap = SubscriptionRequest::new(Vec::new(), Vec::new());
     write_framed(&mut stream, &bootstrap.encode()).await?;
 
     let (ready_bytes, fd_opt) = recv_frame_with_fd(&stream).await?;
@@ -96,22 +89,24 @@ pub async fn setup_shm_consumer_with_metrics(
     let slot_token_generation = Arc::new(AtomicU64::new(ready.slot_token.generation));
     let updates = Arc::new(ArrayQueue::new(CONSUMER_UPDATE_QUEUE_CAPACITY));
     let transactions = Arc::new(ArrayQueue::new(CONSUMER_UPDATE_QUEUE_CAPACITY));
+    let slots = Arc::new(ArrayQueue::new(CONSUMER_UPDATE_QUEUE_CAPACITY));
 
     let reader_task = tokio::spawn(run_reader(
         Arc::clone(&ring),
         Arc::clone(&updates),
         Arc::clone(&transactions),
+        Arc::clone(&slots),
         eventfd,
         Arc::clone(&metrics),
     ));
 
     Ok(QlasterShmConsumer {
         stream: Arc::new(Mutex::new(stream)),
-        client_recv_port,
         slot_token_index,
         slot_token_generation,
         updates,
         transactions,
+        slots,
         metrics,
         reader_task,
         _ring: ring,
@@ -124,15 +119,13 @@ impl QlasterShmConsumer {
         account_pubkeys: Vec<solana_pubkey::Pubkey>,
         account_owners: Vec<solana_pubkey::Pubkey>,
     ) -> Result<(), QlasterError> {
-        let request =
-            SubscriptionRequest::new(self.client_recv_port, account_pubkeys, account_owners)
-                .with_slot_token(self.slot_token());
+        let request = SubscriptionRequest::new(account_pubkeys, account_owners)
+            .with_slot_token(self.slot_token());
         self.send_subscription(request).await
     }
 
     pub async fn subscribe_transactions(&mut self) -> Result<(), QlasterError> {
-        let request = SubscriptionRequest::transactions(self.client_recv_port)
-            .with_slot_token(self.slot_token());
+        let request = SubscriptionRequest::transactions().with_slot_token(self.slot_token());
         self.send_subscription(request).await
     }
 
@@ -169,6 +162,11 @@ impl QlasterShmConsumer {
                     "TransactionUpdate on UDS control channel".into(),
                 ));
             }
+            ServerFrame::SlotUpdate(_) => {
+                return Err(QlasterError::UdsError(
+                    "SlotUpdate on UDS control channel".into(),
+                ));
+            }
         }
         Ok(())
     }
@@ -179,7 +177,7 @@ impl QlasterShmConsumer {
                 "cannot send ping before slot token is assigned",
             ));
         };
-        let ping = PingRequest::new(self.client_recv_port, token);
+        let ping = PingRequest::new(token);
         let encoded = ping.encode();
         let mut guard = self.stream.lock().await;
         write_framed(&mut *guard, &encoded).await?;
@@ -203,6 +201,10 @@ impl QlasterShmConsumer {
         self.transactions.pop()
     }
 
+    pub fn try_next_slot(&self) -> Option<SlotUpdate> {
+        self.slots.pop()
+    }
+
     pub fn metrics(&self) -> Arc<QlasterConsumerMetrics> {
         Arc::clone(&self.metrics)
     }
@@ -212,6 +214,7 @@ async fn run_reader(
     ring: Arc<ShmRingConsumer>,
     updates: Arc<ArrayQueue<AccountUpdate>>,
     transactions: Arc<ArrayQueue<TransactionUpdate>>,
+    slots: Arc<ArrayQueue<SlotUpdate>>,
     eventfd: EventFd,
     metrics: Arc<QlasterConsumerMetrics>,
 ) {
@@ -253,6 +256,17 @@ async fn run_reader(
                                 meta.sender_created_at_unix_nanos,
                                 || {
                                     let _ = transactions.force_push(update);
+                                },
+                            );
+                        }
+                        Ok(ServerFrameWithMeta::SlotUpdate { update, meta }) => {
+                            record_decode_and_enqueue(
+                                &metrics,
+                                read_elapsed_us,
+                                decode_start,
+                                meta.sender_created_at_unix_nanos,
+                                || {
+                                    let _ = slots.force_push(update);
                                 },
                             );
                         }

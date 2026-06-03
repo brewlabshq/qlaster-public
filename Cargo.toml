@@ -9,6 +9,7 @@ bytes = "1.10.1"
 crossbeam-queue = "0.3.12"
 libc = "0.2.182"
 lz4_flex = "0.11.5"
+shaq = "3.0.0"
 solana-bloom = { version = "3.1.11", features=["agave-unstable-api"] }
 solana-pubkey = "3.0.0"
 thiserror = "2.0.17"

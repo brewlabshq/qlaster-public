@@ -1,6 +1,5 @@
 use std::{
     collections::HashSet,
-    net::IpAddr,
     path::PathBuf,
     sync::Arc,
     sync::atomic::{AtomicU64, Ordering},
@@ -16,7 +15,9 @@ use crate::{
     metrics::{QlasterSenderMetrics, unix_time_nanos},
     shm::{EventFd, ShmRingProducer},
     transport::{OutboundFrame, SlotSink},
-    types::{AccountUpdate, PingRequest, SlotToken, SubscriptionRequest, TransactionUpdate},
+    types::{
+        AccountUpdate, PingRequest, SlotToken, SlotUpdate, SubscriptionRequest, TransactionUpdate,
+    },
 };
 
 pub mod shm;
@@ -85,8 +86,6 @@ pub struct ConnectionManager {
 
 #[derive(Debug)]
 pub struct ManagedConnection {
-    pub remote_ip: IpAddr,
-    pub client_recv_port: u16,
     pub slot_index: usize,
     pub connection_id: u64,
     pub filter: Arc<ArcSwap<SubscriptionFilter>>,
@@ -280,25 +279,6 @@ impl ConnectionManager {
         Some(entry)
     }
 
-    fn find_existing(
-        &self,
-        remote_ip: IpAddr,
-        client_recv_port: u16,
-    ) -> Option<Arc<ManagedConnection>> {
-        for (idx, slot) in self.connections.iter().enumerate() {
-            if let Some(existing) = slot.load_full() {
-                if self.maybe_cleanup_stale_slot(idx, &existing) {
-                    continue;
-                }
-                if existing.remote_ip == remote_ip && existing.client_recv_port == client_recv_port
-                {
-                    return Some(existing);
-                }
-            }
-        }
-        None
-    }
-
     fn find_free_slot(&self) -> Option<usize> {
         for (idx, slot) in self.connections.iter().enumerate() {
             match slot.load_full() {
@@ -405,6 +385,41 @@ impl ConnectionManager {
             .record(dispatch_start.elapsed().as_micros() as u64);
     }
 
+    fn dispatch_slot_update(&self, update: SlotUpdate, metrics: &QlasterSenderMetrics) {
+        let dispatch_start = Instant::now();
+        let mut shared_frame: Option<OutboundFrame> = None;
+
+        for (idx, slot) in self.connections.iter().enumerate() {
+            let Some(entry) = slot.load_full() else {
+                continue;
+            };
+            if self.maybe_cleanup_stale_slot(idx, &entry) {
+                continue;
+            }
+            if shared_frame.is_none() {
+                match encode_slot_frame(&update) {
+                    Ok(frame) => shared_frame = Some(frame),
+                    Err(err) => {
+                        tracing::warn!("failed encoding slot update for dispatch: {err}");
+                        metrics
+                            .dispatch
+                            .record(dispatch_start.elapsed().as_micros() as u64);
+                        return;
+                    }
+                }
+            }
+            let framed = shared_frame
+                .as_ref()
+                .expect("encoded payload should exist when a recipient matches")
+                .clone();
+            self.push_to_entry(&entry, framed, metrics);
+        }
+
+        metrics
+            .dispatch
+            .record(dispatch_start.elapsed().as_micros() as u64);
+    }
+
     fn push_to_entry(
         &self,
         entry: &Arc<ManagedConnection>,
@@ -419,9 +434,9 @@ impl ConnectionManager {
             Err(_) => {
                 metrics.shm_ring_full.inc();
                 tracing::warn!(
-                    "shared-memory ring full for {}:{}; disconnecting slow consumer",
-                    entry.remote_ip,
-                    entry.client_recv_port
+                    slot = entry.slot_index,
+                    generation = entry.connection_id,
+                    "shared-memory ring full; disconnecting slow consumer"
                 );
                 self.cleanup_if_same(entry.slot_index, entry.connection_id);
             }
@@ -435,23 +450,10 @@ impl ConnectionManager {
         shm_dir: &std::path::Path,
         ring_capacity: usize,
     ) -> Result<ShmSlotProvision, QlasterError> {
-        // SHM consumers are local; remote_ip is purely used for slot lookup
-        // disambiguation, so we use the loopback address as a stable key.
-        // client_recv_port disambiguates multiple consumers on the same host.
-        let remote_ip = IpAddr::from([127, 0, 0, 1]);
-
         if let Some(existing) = request
             .slot_token
             .and_then(|token| self.lookup_by_token(token))
         {
-            existing
-                .last_seen_ms
-                .store(Self::now_ms(), Ordering::Relaxed);
-            Self::apply_request(&existing.filter, &request);
-            return Ok(ShmSlotProvision::Existing(Self::slot_token(&existing)));
-        }
-
-        if let Some(existing) = self.find_existing(remote_ip, request.client_recv_port) {
             existing
                 .last_seen_ms
                 .store(Self::now_ms(), Ordering::Relaxed);
@@ -465,14 +467,6 @@ impl ConnectionManager {
         let connection_id = self.next_connection_id.fetch_add(1, Ordering::Relaxed);
 
         loop {
-            if let Some(existing) = self.find_existing(remote_ip, request.client_recv_port) {
-                existing
-                    .last_seen_ms
-                    .store(Self::now_ms(), Ordering::Relaxed);
-                Self::apply_request(&existing.filter, &request);
-                return Ok(ShmSlotProvision::Existing(Self::slot_token(&existing)));
-            }
-
             let Some(slot_index) = self.find_free_slot() else {
                 return Err(QlasterError::ConfigError(format!(
                     "connection slots exhausted (max {MAX_CONNECTION_SLOTS})"
@@ -487,8 +481,6 @@ impl ConnectionManager {
             );
 
             let managed = Arc::new(ManagedConnection {
-                remote_ip,
-                client_recv_port: request.client_recv_port,
                 slot_index,
                 connection_id,
                 filter: Arc::clone(&filter),
@@ -538,6 +530,16 @@ fn encode_transaction_frame(update: &TransactionUpdate) -> Result<OutboundFrame,
     })
 }
 
+fn encode_slot_frame(update: &SlotUpdate) -> Result<OutboundFrame, QlasterError> {
+    let frame_start = Instant::now();
+    let (header, payload) = update.encode_parts_at(unix_time_nanos())?;
+    Ok(OutboundFrame {
+        header,
+        payload,
+        frame_start,
+    })
+}
+
 pub async fn setup_sender(
     config: SenderConfig,
     master_updates: broadcast::Sender<AccountUpdate>,
@@ -551,6 +553,25 @@ pub async fn setup_sender_with_transactions(
     config: SenderConfig,
     master_updates: broadcast::Sender<AccountUpdate>,
     transaction_updates: Option<broadcast::Sender<TransactionUpdate>>,
+    bloom_updates_tx: Option<mpsc::UnboundedSender<SubscriptionRequestForward>>,
+    metrics: Arc<QlasterSenderMetrics>,
+) -> Result<QlasterSender, QlasterError> {
+    setup_sender_with_streams(
+        config,
+        master_updates,
+        transaction_updates,
+        None,
+        bloom_updates_tx,
+        metrics,
+    )
+    .await
+}
+
+pub async fn setup_sender_with_streams(
+    config: SenderConfig,
+    master_updates: broadcast::Sender<AccountUpdate>,
+    transaction_updates: Option<broadcast::Sender<TransactionUpdate>>,
+    slot_updates: Option<broadcast::Sender<SlotUpdate>>,
     bloom_updates_tx: Option<mpsc::UnboundedSender<SubscriptionRequestForward>>,
     metrics: Arc<QlasterSenderMetrics>,
 ) -> Result<QlasterSender, QlasterError> {
@@ -592,6 +613,24 @@ pub async fn setup_sender_with_transactions(
                         tracing::warn!(
                             "qlaster transaction dispatcher lagged; skipped {skipped} updates"
                         );
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+    }
+
+    if let Some(slot_updates) = slot_updates {
+        let dispatcher_state = Arc::clone(&state);
+        let mut slot_rx = slot_updates.subscribe();
+        tokio::spawn(async move {
+            loop {
+                match slot_rx.recv().await {
+                    Ok(update) => dispatcher_state
+                        .manager
+                        .dispatch_slot_update(update, &dispatcher_state.metrics),
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!("qlaster slot dispatcher lagged; skipped {skipped} updates");
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
@@ -642,7 +681,6 @@ mod tests {
         let other_owner = Pubkey::new_unique();
 
         let request = SubscriptionRequest::new(
-            9000,
             vec![matched_pubkey, matched_pubkey],
             vec![matched_owner, matched_owner],
         );
@@ -664,14 +702,12 @@ mod tests {
         let second_owner = Pubkey::new_unique();
 
         let filter = SubscriptionFilter::from_request(&SubscriptionRequest::new(
-            9000,
             vec![first_pubkey],
             vec![first_owner],
         ));
         assert!(!filter.matches_account(&sample_update(second_pubkey, second_owner)));
 
         let filter = filter.with_request(&SubscriptionRequest::new(
-            9000,
             vec![second_pubkey],
             vec![second_owner],
         ));
@@ -685,27 +721,21 @@ mod tests {
 
     #[test]
     fn transaction_subscription_is_explicit_and_sticky() {
-        let filter = SubscriptionFilter::from_request(&SubscriptionRequest::new(
-            9000,
-            Vec::new(),
-            Vec::new(),
-        ));
+        let filter =
+            SubscriptionFilter::from_request(&SubscriptionRequest::new(Vec::new(), Vec::new()));
         assert!(!filter.matches_transaction());
 
-        let filter = filter.with_request(&SubscriptionRequest::transactions(9000));
+        let filter = filter.with_request(&SubscriptionRequest::transactions());
         assert!(filter.matches_transaction());
 
-        let filter = filter.with_request(&SubscriptionRequest::new(9000, Vec::new(), Vec::new()));
+        let filter = filter.with_request(&SubscriptionRequest::new(Vec::new(), Vec::new()));
         assert!(filter.matches_transaction());
     }
 
     #[test]
     fn empty_filter_matches_nothing() {
-        let filter = SubscriptionFilter::from_request(&SubscriptionRequest::new(
-            9000,
-            Vec::new(),
-            Vec::new(),
-        ));
+        let filter =
+            SubscriptionFilter::from_request(&SubscriptionRequest::new(Vec::new(), Vec::new()));
 
         assert!(filter.account_pubkeys.is_empty());
         assert!(filter.account_owners.is_empty());

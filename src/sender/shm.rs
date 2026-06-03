@@ -32,11 +32,11 @@ pub(crate) async fn bind_listener(
             cfg.ring_capacity_bytes
         )));
     }
-    if let Some(parent) = cfg.uds_path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| QlasterError::UdsError(format!("create uds parent: {e}")))?;
-        }
+    if let Some(parent) = cfg.uds_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| QlasterError::UdsError(format!("create uds parent: {e}")))?;
     }
     // Best-effort cleanup of a stale socket file.
     let _ = std::fs::remove_file(&cfg.uds_path);

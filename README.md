@@ -2,7 +2,7 @@
 
 Shared-memory data streaming for colocated Solana services.
 
-Account and transaction updates are fanned out from a single sender to local
+Account, transaction, and slot updates are fanned out from a single sender to local
 consumers over a per-consumer SPSC ring in `/dev/shm`, with a Unix-domain
 control socket for handshake, subscription, and eventfd-based wakeups.
 
@@ -23,7 +23,7 @@ control socket for handshake, subscription, and eventfd-based wakeups.
 
 - `sender/` — binds the UDS, provisions a ring + eventfd per consumer, runs
   the dispatcher tasks fed by `broadcast::Sender<AccountUpdate>` /
-  `broadcast::Sender<TransactionUpdate>`.
+  `broadcast::Sender<TransactionUpdate>` / `broadcast::Sender<SlotUpdate>`.
 - `consumer/` — connects to the UDS, receives the ring path + eventfd via
   `SCM_RIGHTS`, drains frames into `crossbeam_queue::ArrayQueue`s the caller
   polls.
@@ -44,13 +44,13 @@ let cfg = SenderConfig { shm: ShmTransportConfig::defaults("/tmp/qlaster.sock") 
 let sender = setup_sender(cfg, updates_tx.clone(), None, Arc::new(QlasterSenderMetrics::new())).await?;
 tokio::spawn(sender.run());
 
-let mut consumer = setup_shm_consumer("/tmp/qlaster.sock", 9000).await?;
+let mut consumer = setup_shm_consumer("/tmp/qlaster.sock").await?;
 consumer.subscribe(vec![pubkey], vec![]).await?;
 while let Some(update) = consumer.updates.pop() { /* ... */ }
 ```
 
 See `tests/shm_flow.rs` for end-to-end examples (account filtering, transaction
-opt-in, reconnection).
+opt-in, always-on slot updates, reconnection).
 
 ## Requirements
 
