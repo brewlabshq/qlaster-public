@@ -5,8 +5,8 @@ use std::time::{Duration, Instant};
 use qlaster::consumer::setup_shm_consumer;
 use qlaster::metrics::QlasterSenderMetrics;
 use qlaster::sender::{
-    setup_sender, setup_sender_with_streams, setup_sender_with_transactions, SenderConfig,
-    ShmTransportConfig,
+    SenderConfig, ShmTransportConfig, setup_sender, setup_sender_with_streams,
+    setup_sender_with_transactions,
 };
 use qlaster::types::{
     AccountPayload, AccountUpdate, SlotUpdate, TransactionPayload, TransactionUpdate,

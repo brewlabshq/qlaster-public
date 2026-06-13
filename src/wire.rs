@@ -38,7 +38,7 @@ mod tests {
     use std::io::ErrorKind;
 
     use super::*;
-    use tokio::io::{duplex, AsyncWriteExt};
+    use tokio::io::{AsyncWriteExt, duplex};
 
     #[tokio::test]
     async fn framed_roundtrip_supports_multiple_and_empty_payloads() {
