@@ -1452,4 +1452,82 @@ mod tests {
         let payload = vec![0u8; ACCOUNT_UPDATE_COMPRESSION_THRESHOLD_BYTES - 1];
         assert!(!should_attempt_lz4(&payload));
     }
+
+    #[test]
+    fn account_update_lz4_roundtrip_for_large_compressible_payload() {
+        // Low-entropy payload comfortably above the compression threshold, so
+        // the LZ4 path actually engages (unlike the small-payload roundtrip
+        // tests above, which never set the compression flag).
+        let raw = vec![0xABu8; ACCOUNT_UPDATE_COMPRESSION_THRESHOLD_BYTES + 128 * 1024];
+        let update = AccountUpdate {
+            account_pubkey: Pubkey::new_unique(),
+            account_owner: Pubkey::new_unique(),
+            lamports: 5,
+            executable: true,
+            rent_epoch: 3,
+            slot: 77,
+            write_version: 9,
+            payload: AccountPayload::from_slice(&raw).expect("payload"),
+        };
+
+        let bytes = update.encode().expect("encode update");
+
+        // The compression flag must be set and the on-wire payload must be
+        // smaller than the raw payload for a run this compressible.
+        let decoded = DecodedAccountUpdate::parse(&bytes).expect("parse header");
+        assert!(decoded.compressed, "LZ4 flag should be set");
+        assert_eq!(decoded.raw_payload_len, raw.len());
+        assert!(
+            decoded.wire_payload_len < decoded.raw_payload_len,
+            "compressed wire payload {} should be smaller than raw {}",
+            decoded.wire_payload_len,
+            decoded.raw_payload_len,
+        );
+
+        // Both decode paths must reconstruct the original payload exactly.
+        let round = AccountUpdate::decode(&bytes).expect("decode update");
+        assert_eq!(round, update);
+        assert_eq!(round.payload.as_slice(), raw.as_slice());
+
+        let round_owned = AccountUpdate::decode_owned(bytes).expect("decode_owned update");
+        assert_eq!(round_owned, update);
+    }
+
+    #[test]
+    fn account_update_rejects_corrupted_lz4_declared_length() {
+        let raw = vec![0x5Cu8; ACCOUNT_UPDATE_COMPRESSION_THRESHOLD_BYTES + 4096];
+        let update = AccountUpdate {
+            account_pubkey: Pubkey::new_unique(),
+            account_owner: Pubkey::new_unique(),
+            lamports: 1,
+            executable: false,
+            rent_epoch: 0,
+            slot: 1,
+            write_version: 1,
+            payload: AccountPayload::from_slice(&raw).expect("payload"),
+        };
+        let mut bytes = update.encode().expect("encode update");
+        assert!(
+            DecodedAccountUpdate::parse(&bytes)
+                .expect("parse header")
+                .compressed,
+            "precondition: payload must be compressed"
+        );
+
+        // The declared decompressed length sits in the fixed header just before
+        // the on-wire (compressed) length. Corrupt it so it disagrees with the
+        // actual LZ4 output; decode must reject rather than return wrong data.
+        let raw_len_off = ACCOUNT_UPDATE_FIXED_BYTES - 8;
+        let bogus = (raw.len() as u32 + 1).to_le_bytes();
+        bytes[raw_len_off..raw_len_off + 4].copy_from_slice(&bogus);
+
+        assert!(matches!(
+            AccountUpdate::decode(&bytes),
+            Err(QlasterError::MalformedPayload(_))
+        ));
+        assert!(matches!(
+            AccountUpdate::decode_owned(bytes),
+            Err(QlasterError::MalformedPayload(_))
+        ));
+    }
 }
