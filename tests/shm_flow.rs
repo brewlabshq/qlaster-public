@@ -20,9 +20,14 @@ fn unique_paths(label: &str) -> (PathBuf, PathBuf) {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let base = std::env::temp_dir().join(format!("qlaster-shm-{label}-{pid}-{nonce}"));
-    let uds = base.join("control.sock");
-    let shm = base.join("rings");
+    // macOS's sun_path is 104 bytes. std::env::temp_dir() returns a long
+    // /var/folders/…/T/ path on macOS CI; nesting the socket inside it
+    // overflows the limit and causes UnixListener::bind to fail. Use /tmp
+    // directly for the socket so the path stays well under 104 bytes.
+    let uds = PathBuf::from(format!("/tmp/qlq-{label}-{pid}-{nonce}.sock"));
+    let shm = std::env::temp_dir()
+        .join(format!("qlaster-shm-{label}-{pid}-{nonce}"))
+        .join("rings");
     (uds, shm)
 }
 
