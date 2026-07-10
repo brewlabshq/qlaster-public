@@ -12,7 +12,7 @@ use crate::{
     error::QlasterError,
     sender::{SenderState, ShmSlotProvision, ShmTransportConfig},
     shm::send_frame_with_fd,
-    types::{decode_client_frame, ClientFrame, ConnectionReady, ConnectionReadyShm},
+    types::{ClientFrame, ConnectionReady, ConnectionReadyShm, decode_client_frame},
     wire::{read_framed, write_framed},
 };
 
