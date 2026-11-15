@@ -492,9 +492,9 @@ dependencies = [
 
 [[package]]
 name = "solana-bloom"
-version = "4.0.1"
+version = "4.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "883f17382e11f523350f80c4f4b0e547492bb7752ef6321802cfda7be79790ba"
+checksum = "417fc08a44031d3098aba60dbe4313b3e7c50c56c0026fd38e9e8df2b1acb1c2"
 dependencies = [
  "bv",
  "fnv",
