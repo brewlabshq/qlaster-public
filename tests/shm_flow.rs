@@ -401,6 +401,58 @@ async fn shm_transaction_signer_filter_delivers_only_signed() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sender_interest_tracks_subscriptions() {
+    let cfg = shm_config("interest");
+    let uds_path = cfg.uds_path.clone();
+
+    let (updates_tx, _) = broadcast::channel::<AccountUpdate>(128);
+    let (transactions_tx, _) = broadcast::channel::<TransactionUpdate>(128);
+    let sender = setup_sender_with_transactions(
+        SenderConfig { shm: cfg },
+        updates_tx.clone(),
+        Some(transactions_tx.clone()),
+        None,
+        Arc::new(QlasterSenderMetrics::new()),
+    )
+    .await
+    .expect("setup sender");
+    let interest = sender.interest();
+    let _sender_task = tokio::spawn(sender.run());
+
+    let wallet = test_pubkey(11);
+    let account = test_pubkey(12);
+    let owner = test_pubkey(13);
+    let other = test_pubkey(14);
+
+    assert!(!interest.has_consumers());
+    assert!(!interest.wants_transactions());
+    assert!(!interest.wants_account(&account, &owner));
+
+    let mut consumer = setup_shm_consumer(&uds_path).await.expect("setup consumer");
+    consumer
+        .subscribe_transactions_signed_by(vec![wallet])
+        .await
+        .expect("signer subscribe");
+    consumer
+        .subscribe(vec![account], Vec::new())
+        .await
+        .expect("account subscribe");
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !(interest.wants_transactions() && interest.wants_account(&account, &other)) {
+        assert!(
+            Instant::now() < deadline,
+            "interest never reflected subscriptions"
+        );
+        tokio::task::yield_now().await;
+    }
+    assert!(interest.has_consumers());
+    assert!(interest.wants_transaction_signed_by(&[other, wallet]));
+    assert!(!interest.wants_transaction_signed_by(&[other]));
+    assert!(!interest.wants_account(&other, &owner));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shm_slot_stream_is_always_on() {
     let cfg = shm_config("slots");
     let uds_path = cfg.uds_path.clone();

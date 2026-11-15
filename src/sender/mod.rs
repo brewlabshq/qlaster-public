@@ -79,6 +79,69 @@ impl QlasterSender {
     pub fn metrics(&self) -> Arc<QlasterSenderMetrics> {
         Arc::clone(&self.state.metrics)
     }
+
+    /// Cheap, cloneable handle a producer can consult *before* building an
+    /// update, so account data is not copied and transactions are not
+    /// serialized when no connected consumer would receive them. Grab it
+    /// before calling [`QlasterSender::run`].
+    pub fn interest(&self) -> SenderInterest {
+        SenderInterest {
+            manager: Arc::clone(&self.state.manager),
+        }
+    }
+}
+
+/// Producer-side pre-check backed by the sender's routing index. Every
+/// method is lock-free: one atomic load plus hash lookups. A `true` answer
+/// may occasionally be stale (a consumer just left); the dispatcher still
+/// filters authoritatively, so this is only ever an optimization.
+#[derive(Clone, Debug)]
+pub struct SenderInterest {
+    manager: Arc<ConnectionManager>,
+}
+
+impl SenderInterest {
+    /// Any consumer subscribed to transactions (all, or by signer).
+    #[inline]
+    pub fn wants_transactions(&self) -> bool {
+        !self.manager.tx_routing.load().tx_is_empty()
+    }
+
+    /// Any consumer would receive a transaction with these signers.
+    #[inline]
+    pub fn wants_transaction_signed_by(&self, signers: &[solana_pubkey::Pubkey]) -> bool {
+        self.manager
+            .tx_routing
+            .load()
+            .recipients_for_signers(signers)
+            != 0
+    }
+
+    /// Any consumer would receive an update for this account.
+    #[inline]
+    pub fn wants_account(
+        &self,
+        pubkey: &solana_pubkey::Pubkey,
+        owner: &solana_pubkey::Pubkey,
+    ) -> bool {
+        let mut mask = self.manager.tx_routing.load().account_mask;
+        while mask != 0 {
+            let idx = mask.trailing_zeros() as usize;
+            mask &= mask - 1;
+            if let Some(entry) = self.manager.connections[idx].load_full() {
+                if entry.filter.load().matches_account_keys(pubkey, owner) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// At least one consumer is connected (slot updates go to everyone).
+    #[inline]
+    pub fn has_consumers(&self) -> bool {
+        self.manager.tx_routing.load().connected_mask != 0
+    }
 }
 
 #[derive(Debug)]
@@ -98,7 +161,8 @@ pub struct ConnectionManager {
     tx_routing_rebuild: Mutex<()>,
 }
 
-/// Which connection slots want a transaction, keyed so the dispatcher does
+/// Which connection slots want a transaction (and which have any account
+/// filter / are connected at all), keyed so the dispatcher does
 /// O(signers) hash lookups per transaction instead of evaluating every
 /// consumer's filter. Mirrors the mentioned-address index Agave keeps for
 /// `logsSubscribe` mentions. Rebuilt only when subscriptions or slots change.
@@ -108,19 +172,28 @@ struct TxRouting {
     all_mask: SlotMask,
     /// Slots subscribed to transactions signed by a given key.
     by_signer: HashMap<solana_pubkey::Pubkey, SlotMask>,
+    /// Slots with a non-empty account pubkey/owner filter.
+    account_mask: SlotMask,
+    /// Slots with a live connection.
+    connected_mask: SlotMask,
 }
 
 impl TxRouting {
     #[inline]
-    fn is_empty(&self) -> bool {
+    fn tx_is_empty(&self) -> bool {
         self.all_mask == 0 && self.by_signer.is_empty()
     }
 
     #[inline]
     fn recipients(&self, update: &TransactionUpdate) -> SlotMask {
+        self.recipients_for_signers(&update.signers)
+    }
+
+    #[inline]
+    fn recipients_for_signers(&self, signers: &[solana_pubkey::Pubkey]) -> SlotMask {
         let mut mask = self.all_mask;
         if !self.by_signer.is_empty() {
-            for signer in &update.signers {
+            for signer in signers {
                 if let Some(bits) = self.by_signer.get(signer) {
                     mask |= *bits;
                 }
@@ -234,33 +307,45 @@ impl SubscriptionFilter {
     }
 
     fn matches_account(&self, update: &AccountUpdate) -> bool {
+        self.matches_account_keys(&update.account_pubkey, &update.account_owner)
+    }
+
+    fn has_account_filter(&self) -> bool {
+        !self.account_pubkeys.is_empty() || !self.account_owners.is_empty()
+    }
+
+    fn matches_account_keys(
+        &self,
+        account_pubkey: &solana_pubkey::Pubkey,
+        account_owner: &solana_pubkey::Pubkey,
+    ) -> bool {
         match (self.single_pubkey, self.single_owner) {
             (Some(pubkey), None) if self.account_owners.is_empty() => {
-                return pubkey == update.account_pubkey;
+                return pubkey == *account_pubkey;
             }
             (None, Some(owner)) if self.account_pubkeys.is_empty() => {
-                return owner == update.account_owner;
+                return owner == *account_owner;
             }
             (Some(pubkey), Some(owner))
                 if self.account_pubkeys.len() == 1 && self.account_owners.len() == 1 =>
             {
-                return pubkey == update.account_pubkey || owner == update.account_owner;
+                return pubkey == *account_pubkey || owner == *account_owner;
             }
             _ => {}
         }
 
         if self.use_bloom_fast_reject {
-            let maybe_pubkey = self.bloom.contains(&update.account_pubkey.to_bytes());
-            let maybe_owner = self.bloom.contains(&update.account_owner.to_bytes());
+            let maybe_pubkey = self.bloom.contains(&account_pubkey.to_bytes());
+            let maybe_owner = self.bloom.contains(&account_owner.to_bytes());
             if !maybe_pubkey && !maybe_owner {
                 return false;
             }
         }
 
-        self.account_pubkeys.contains(&update.account_pubkey)
-            || self.account_owners.contains(&update.account_owner)
+        self.account_pubkeys.contains(account_pubkey) || self.account_owners.contains(account_owner)
     }
 
+    #[cfg(test)]
     fn wants_transactions(&self) -> bool {
         self.include_transactions || !self.transaction_signers.is_empty()
     }
@@ -284,7 +369,8 @@ impl ConnectionManager {
         let current = filter.load_full();
         let next = Arc::new(current.with_request(request));
         let routing_changed = next.include_transactions != current.include_transactions
-            || next.transaction_signers.len() != current.transaction_signers.len();
+            || next.transaction_signers.len() != current.transaction_signers.len()
+            || next.has_account_filter() != current.has_account_filter();
         filter.store(next);
         if routing_changed {
             self.rebuild_tx_routing();
@@ -313,7 +399,11 @@ impl ConnectionManager {
                 continue;
             };
             let bit: SlotMask = 1 << idx;
+            routing.connected_mask |= bit;
             let filter = entry.filter.load();
+            if filter.has_account_filter() {
+                routing.account_mask |= bit;
+            }
             if filter.include_transactions {
                 routing.all_mask |= bit;
             } else {
@@ -323,10 +413,6 @@ impl ConnectionManager {
             }
         }
         self.tx_routing.store(Arc::new(routing));
-    }
-
-    fn slot_wants_transactions(entry: &ManagedConnection) -> bool {
-        entry.filter.load().wants_transactions()
     }
 
     fn now_ms() -> u64 {
@@ -349,17 +435,11 @@ impl ConnectionManager {
             .map(|entry| entry.connection_id == connection_id)
             .unwrap_or(false)
         {
-            let wanted_transactions = current
-                .as_ref()
-                .map(|entry| {
-                    entry.sink.close();
-                    Self::slot_wants_transactions(entry)
-                })
-                .unwrap_or(false);
-            let _ = self.connections[slot_index].compare_and_swap(&current, None);
-            if wanted_transactions {
-                self.rebuild_tx_routing();
+            if let Some(entry) = current.as_ref() {
+                entry.sink.close();
             }
+            let _ = self.connections[slot_index].compare_and_swap(&current, None);
+            self.rebuild_tx_routing();
         }
     }
 
@@ -370,9 +450,7 @@ impl ConnectionManager {
         entry.sink.close();
         let expected = Some(Arc::clone(entry));
         let _ = self.connections[idx].compare_and_swap(&expected, None);
-        if Self::slot_wants_transactions(entry) {
-            self.rebuild_tx_routing();
-        }
+        self.rebuild_tx_routing();
         true
     }
 
@@ -467,7 +545,7 @@ impl ConnectionManager {
         // Hot path: one atomic load, then O(signers) lookups. Nothing is
         // encoded and no slot is touched unless some consumer wants it.
         let routing = self.tx_routing.load();
-        if routing.is_empty() {
+        if routing.tx_is_empty() {
             return;
         }
         let mut mask = routing.recipients(&update);
@@ -616,9 +694,7 @@ impl ConnectionManager {
             let previous = self.connections[slot_index]
                 .compare_and_swap(&None::<Arc<ManagedConnection>>, Some(Arc::clone(&managed)));
             if previous.is_none() {
-                if Self::slot_wants_transactions(&managed) {
-                    self.rebuild_tx_routing();
-                }
+                self.rebuild_tx_routing();
                 let slot_token = SlotToken::new(slot_index as u8, connection_id);
                 tracing::info!(
                     transport = "shm",
@@ -896,7 +972,7 @@ mod tests {
         let wallet_a = Pubkey::new_unique();
         let wallet_b = Pubkey::new_unique();
         let mut routing = TxRouting::default();
-        assert!(routing.is_empty());
+        assert!(routing.tx_is_empty());
 
         routing.by_signer.insert(wallet_a, 0b0010);
         routing.by_signer.insert(wallet_b, 0b0100);
