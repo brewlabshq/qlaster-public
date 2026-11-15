@@ -1,8 +1,8 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::PathBuf,
-    sync::Arc,
     sync::atomic::{AtomicU64, Ordering},
+    sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -30,6 +30,9 @@ pub use shm::ShmListenerHandle;
 pub type SubscriptionRequestForward = (SubscriptionRequest, Instant);
 
 const MAX_CONNECTION_SLOTS: usize = 10;
+/// One bit per connection slot.
+type SlotMask = u16;
+const _: () = assert!(MAX_CONNECTION_SLOTS <= SlotMask::BITS as usize);
 const SLOT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const DEFAULT_SHM_RING_CAPACITY: usize = 64 * 1024 * 1024;
 
@@ -89,6 +92,42 @@ pub(crate) struct SenderState {
 pub struct ConnectionManager {
     pub connections: [ArcSwapOption<ManagedConnection>; MAX_CONNECTION_SLOTS],
     next_connection_id: AtomicU64,
+    /// Inverted transaction-subscription index read on the dispatch hot path.
+    tx_routing: ArcSwap<TxRouting>,
+    /// Serializes `tx_routing` rebuilds so a stale snapshot never wins.
+    tx_routing_rebuild: Mutex<()>,
+}
+
+/// Which connection slots want a transaction, keyed so the dispatcher does
+/// O(signers) hash lookups per transaction instead of evaluating every
+/// consumer's filter. Mirrors the mentioned-address index Agave keeps for
+/// `logsSubscribe` mentions. Rebuilt only when subscriptions or slots change.
+#[derive(Debug, Default)]
+struct TxRouting {
+    /// Slots subscribed to every transaction.
+    all_mask: SlotMask,
+    /// Slots subscribed to transactions signed by a given key.
+    by_signer: HashMap<solana_pubkey::Pubkey, SlotMask>,
+}
+
+impl TxRouting {
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.all_mask == 0 && self.by_signer.is_empty()
+    }
+
+    #[inline]
+    fn recipients(&self, update: &TransactionUpdate) -> SlotMask {
+        let mut mask = self.all_mask;
+        if !self.by_signer.is_empty() {
+            for signer in &update.signers {
+                if let Some(bits) = self.by_signer.get(signer) {
+                    mask |= *bits;
+                }
+            }
+        }
+        mask
+    }
 }
 
 #[derive(Debug)]
@@ -119,6 +158,7 @@ pub struct SubscriptionFilter {
     pub account_owners: HashSet<solana_pubkey::Pubkey>,
     pub bloom: Bloom<[u8; 32]>,
     pub include_transactions: bool,
+    pub transaction_signers: HashSet<solana_pubkey::Pubkey>,
     single_pubkey: Option<solana_pubkey::Pubkey>,
     single_owner: Option<solana_pubkey::Pubkey>,
     use_bloom_fast_reject: bool,
@@ -129,6 +169,7 @@ impl SubscriptionFilter {
         account_pubkeys: HashSet<solana_pubkey::Pubkey>,
         account_owners: HashSet<solana_pubkey::Pubkey>,
         include_transactions: bool,
+        transaction_signers: HashSet<solana_pubkey::Pubkey>,
     ) -> Self {
         let requested_items = account_pubkeys.len() + account_owners.len();
         let mut bloom = Bloom::random(requested_items.max(1), 0.001, 1 << 20);
@@ -151,6 +192,7 @@ impl SubscriptionFilter {
             account_owners,
             bloom,
             include_transactions,
+            transaction_signers,
             single_pubkey,
             single_owner,
             use_bloom_fast_reject,
@@ -168,7 +210,12 @@ impl SubscriptionFilter {
             account_owners.insert(*owner);
         }
 
-        Self::from_sets(account_pubkeys, account_owners, req.include_transactions)
+        Self::from_sets(
+            account_pubkeys,
+            account_owners,
+            req.include_transactions,
+            req.transaction_signers.iter().copied().collect(),
+        )
     }
 
     fn with_request(&self, req: &SubscriptionRequest) -> Self {
@@ -176,10 +223,13 @@ impl SubscriptionFilter {
         let mut account_owners = self.account_owners.clone();
         account_pubkeys.extend(req.account_pubkeys.iter().copied());
         account_owners.extend(req.account_owners.iter().copied());
+        let mut transaction_signers = self.transaction_signers.clone();
+        transaction_signers.extend(req.transaction_signers.iter().copied());
         Self::from_sets(
             account_pubkeys,
             account_owners,
             self.include_transactions || req.include_transactions,
+            transaction_signers,
         )
     }
 
@@ -211,23 +261,72 @@ impl SubscriptionFilter {
             || self.account_owners.contains(&update.account_owner)
     }
 
-    fn matches_transaction(&self) -> bool {
+    fn wants_transactions(&self) -> bool {
+        self.include_transactions || !self.transaction_signers.is_empty()
+    }
+
+    fn matches_transaction(&self, update: &TransactionUpdate) -> bool {
         self.include_transactions
+            || (!self.transaction_signers.is_empty()
+                && update
+                    .signers
+                    .iter()
+                    .any(|signer| self.transaction_signers.contains(signer)))
     }
 }
 
 impl ConnectionManager {
-    fn apply_request(filter: &Arc<ArcSwap<SubscriptionFilter>>, request: &SubscriptionRequest) {
+    fn apply_request(
+        &self,
+        filter: &Arc<ArcSwap<SubscriptionFilter>>,
+        request: &SubscriptionRequest,
+    ) {
         let current = filter.load_full();
         let next = Arc::new(current.with_request(request));
+        let routing_changed = next.include_transactions != current.include_transactions
+            || next.transaction_signers.len() != current.transaction_signers.len();
         filter.store(next);
+        if routing_changed {
+            self.rebuild_tx_routing();
+        }
     }
 
     fn new() -> Self {
         Self {
             connections: std::array::from_fn(|_| ArcSwapOption::empty()),
             next_connection_id: AtomicU64::new(1),
+            tx_routing: ArcSwap::from_pointee(TxRouting::default()),
+            tx_routing_rebuild: Mutex::new(()),
         }
+    }
+
+    /// Recompute the transaction routing index from the live slots. Cold
+    /// path: runs on subscription changes and slot removal only.
+    fn rebuild_tx_routing(&self) {
+        let _guard = self
+            .tx_routing_rebuild
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut routing = TxRouting::default();
+        for (idx, slot) in self.connections.iter().enumerate() {
+            let Some(entry) = slot.load_full() else {
+                continue;
+            };
+            let bit: SlotMask = 1 << idx;
+            let filter = entry.filter.load();
+            if filter.include_transactions {
+                routing.all_mask |= bit;
+            } else {
+                for signer in &filter.transaction_signers {
+                    *routing.by_signer.entry(*signer).or_default() |= bit;
+                }
+            }
+        }
+        self.tx_routing.store(Arc::new(routing));
+    }
+
+    fn slot_wants_transactions(entry: &ManagedConnection) -> bool {
+        entry.filter.load().wants_transactions()
     }
 
     fn now_ms() -> u64 {
@@ -250,10 +349,17 @@ impl ConnectionManager {
             .map(|entry| entry.connection_id == connection_id)
             .unwrap_or(false)
         {
-            if let Some(entry) = current.as_ref() {
-                entry.sink.close();
-            }
+            let wanted_transactions = current
+                .as_ref()
+                .map(|entry| {
+                    entry.sink.close();
+                    Self::slot_wants_transactions(entry)
+                })
+                .unwrap_or(false);
             let _ = self.connections[slot_index].compare_and_swap(&current, None);
+            if wanted_transactions {
+                self.rebuild_tx_routing();
+            }
         }
     }
 
@@ -264,6 +370,9 @@ impl ConnectionManager {
         entry.sink.close();
         let expected = Some(Arc::clone(entry));
         let _ = self.connections[idx].compare_and_swap(&expected, None);
+        if Self::slot_wants_transactions(entry) {
+            self.rebuild_tx_routing();
+        }
         true
     }
 
@@ -355,36 +464,45 @@ impl ConnectionManager {
         update: TransactionUpdate,
         metrics: &QlasterSenderMetrics,
     ) {
-        let dispatch_start = Instant::now();
-        let mut shared_frame: Option<OutboundFrame> = None;
+        // Hot path: one atomic load, then O(signers) lookups. Nothing is
+        // encoded and no slot is touched unless some consumer wants it.
+        let routing = self.tx_routing.load();
+        if routing.is_empty() {
+            return;
+        }
+        let mut mask = routing.recipients(&update);
+        drop(routing);
+        if mask == 0 {
+            return;
+        }
 
-        for (idx, slot) in self.connections.iter().enumerate() {
-            let Some(entry) = slot.load_full() else {
+        let dispatch_start = Instant::now();
+        let frame = match encode_transaction_frame(&update) {
+            Ok(frame) => frame,
+            Err(err) => {
+                tracing::warn!("failed encoding transaction update for dispatch: {err}");
+                metrics
+                    .dispatch
+                    .record(dispatch_start.elapsed().as_micros() as u64);
+                return;
+            }
+        };
+
+        while mask != 0 {
+            let idx = mask.trailing_zeros() as usize;
+            mask &= mask - 1;
+            let Some(entry) = self.connections[idx].load_full() else {
                 continue;
             };
             if self.maybe_cleanup_stale_slot(idx, &entry) {
                 continue;
             }
-            if !entry.filter.load().matches_transaction() {
+            // The index may briefly lag a slot being reused; confirm against
+            // the recipient's own filter (cheap: only matched slots get here).
+            if !entry.filter.load().matches_transaction(&update) {
                 continue;
             }
-            if shared_frame.is_none() {
-                match encode_transaction_frame(&update) {
-                    Ok(frame) => shared_frame = Some(frame),
-                    Err(err) => {
-                        tracing::warn!("failed encoding transaction update for dispatch: {err}");
-                        metrics
-                            .dispatch
-                            .record(dispatch_start.elapsed().as_micros() as u64);
-                        return;
-                    }
-                }
-            }
-            let framed = shared_frame
-                .as_ref()
-                .expect("encoded payload should exist when a recipient matches")
-                .clone();
-            self.push_to_entry(&entry, framed, metrics);
+            self.push_to_entry(&entry, frame.clone(), metrics);
         }
 
         metrics
@@ -464,7 +582,7 @@ impl ConnectionManager {
             existing
                 .last_seen_ms
                 .store(Self::now_ms(), Ordering::Relaxed);
-            Self::apply_request(&existing.filter, &request);
+            self.apply_request(&existing.filter, &request);
             return Ok(ShmSlotProvision::Existing(Self::slot_token(&existing)));
         }
 
@@ -498,6 +616,9 @@ impl ConnectionManager {
             let previous = self.connections[slot_index]
                 .compare_and_swap(&None::<Arc<ManagedConnection>>, Some(Arc::clone(&managed)));
             if previous.is_none() {
+                if Self::slot_wants_transactions(&managed) {
+                    self.rebuild_tx_routing();
+                }
                 let slot_token = SlotToken::new(slot_index as u8, connection_id);
                 tracing::info!(
                     transport = "shm",
@@ -726,17 +847,72 @@ mod tests {
         assert!(filter.matches_account(&sample_update(second_pubkey, second_owner)));
     }
 
+    fn sample_tx(signers: Vec<Pubkey>) -> TransactionUpdate {
+        TransactionUpdate::new(1, 0, [0u8; 64], false, bytes::Bytes::from_static(b"tx"))
+            .expect("tx")
+            .with_signers(signers)
+    }
+
     #[test]
     fn transaction_subscription_is_explicit_and_sticky() {
+        let tx = sample_tx(vec![Pubkey::new_unique()]);
         let filter =
             SubscriptionFilter::from_request(&SubscriptionRequest::new(Vec::new(), Vec::new()));
-        assert!(!filter.matches_transaction());
+        assert!(!filter.wants_transactions());
+        assert!(!filter.matches_transaction(&tx));
 
         let filter = filter.with_request(&SubscriptionRequest::transactions());
-        assert!(filter.matches_transaction());
+        assert!(filter.matches_transaction(&tx));
 
         let filter = filter.with_request(&SubscriptionRequest::new(Vec::new(), Vec::new()));
-        assert!(filter.matches_transaction());
+        assert!(filter.matches_transaction(&tx));
+    }
+
+    #[test]
+    fn signer_subscription_matches_only_signed_transactions() {
+        let wallet = Pubkey::new_unique();
+        let other = Pubkey::new_unique();
+        let filter =
+            SubscriptionFilter::from_request(&SubscriptionRequest::transactions_signed_by(vec![
+                wallet,
+            ]));
+        assert!(filter.wants_transactions());
+        assert!(!filter.include_transactions);
+
+        // Fee payer and secondary signer both count.
+        assert!(filter.matches_transaction(&sample_tx(vec![wallet])));
+        assert!(filter.matches_transaction(&sample_tx(vec![other, wallet])));
+        assert!(!filter.matches_transaction(&sample_tx(vec![other])));
+        // Producer that never attached signers can never match a signer filter.
+        assert!(!filter.matches_transaction(&sample_tx(Vec::new())));
+
+        // Signer sets accumulate across requests.
+        let filter = filter.with_request(&SubscriptionRequest::transactions_signed_by(vec![other]));
+        assert!(filter.matches_transaction(&sample_tx(vec![other])));
+    }
+
+    #[test]
+    fn tx_routing_ors_all_and_signer_masks() {
+        let wallet_a = Pubkey::new_unique();
+        let wallet_b = Pubkey::new_unique();
+        let mut routing = TxRouting::default();
+        assert!(routing.is_empty());
+
+        routing.by_signer.insert(wallet_a, 0b0010);
+        routing.by_signer.insert(wallet_b, 0b0100);
+        assert_eq!(routing.recipients(&sample_tx(vec![wallet_a])), 0b0010);
+        assert_eq!(
+            routing.recipients(&sample_tx(vec![wallet_a, wallet_b])),
+            0b0110
+        );
+        assert_eq!(
+            routing.recipients(&sample_tx(vec![Pubkey::new_unique()])),
+            0
+        );
+
+        routing.all_mask = 0b0001;
+        assert_eq!(routing.recipients(&sample_tx(Vec::new())), 0b0001);
+        assert_eq!(routing.recipients(&sample_tx(vec![wallet_b])), 0b0101);
     }
 
     #[test]

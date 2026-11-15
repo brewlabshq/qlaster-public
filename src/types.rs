@@ -11,16 +11,18 @@ const REQUEST_PING_TAG: u8 = 4; // keepalive ping sent from client to sender
 const READY_SHM_TAG: u8 = 5; // sender -> client SHM ring handshake (UDS-only)
 const TRANSACTION_UPDATE_TAG: u8 = 6; // transaction update sent from sender to client
 const SLOT_UPDATE_TAG: u8 = 7; // Solana slot update sent from sender to client
-const WIRE_VERSION: u8 = 9; // allows safe protocol evolution with explicit version checks
+const WIRE_VERSION: u8 = 10; // allows safe protocol evolution with explicit version checks
 const UNSET_SLOT_INDEX: u8 = u8::MAX;
 pub const MAX_ACCOUNT_PAYLOAD_BYTES: usize = 10 * 1024 * 1024; // solana account data upper bound
 pub const MAX_TRANSACTION_PAYLOAD_BYTES: usize = 10 * 1024 * 1024;
+/// Upper bound on signer keys carried per transaction update (Solana packets fit far fewer).
+pub const MAX_TRANSACTION_SIGNERS: usize = 64;
 const ACCOUNT_UPDATE_FLAG_LZ4: u8 = 0x1;
 const ACCOUNT_UPDATE_COMPRESSION_THRESHOLD_BYTES: usize = 500 * 1024;
 const ACCOUNT_UPDATE_COMPRESSION_SAMPLE_BYTES: usize = 8 * 1024;
 const ACCOUNT_UPDATE_COMPRESSION_MIN_GAIN_BPS: usize = 75;
 const ACCOUNT_UPDATE_FIXED_BYTES: usize = 2 + 8 + (32 * 2) + (8 * 4) + 1 + 1 + 4 + 4;
-const TRANSACTION_UPDATE_FIXED_BYTES: usize = 2 + 8 + 8 + 4 + 1 + 64 + 4;
+const TRANSACTION_UPDATE_FIXED_BYTES: usize = 2 + 8 + 8 + 4 + 1 + 64 + 1 + 4;
 const SLOT_UPDATE_FIXED_BYTES: usize = 2 + 8 + 8;
 
 fn should_attempt_lz4(payload: &[u8]) -> bool {
@@ -94,7 +96,11 @@ pub struct SubscriptionRequest {
     pub slot_token: Option<SlotToken>,
     pub account_pubkeys: Vec<Pubkey>,
     pub account_owners: Vec<Pubkey>,
+    /// Deliver every transaction, regardless of `transaction_signers`.
     pub include_transactions: bool,
+    /// Deliver transactions signed by any of these keys (fee payer or any
+    /// other required signer). Ignored when `include_transactions` is set.
+    pub transaction_signers: Vec<Pubkey>,
 }
 
 impl SubscriptionRequest {
@@ -104,6 +110,7 @@ impl SubscriptionRequest {
             account_pubkeys,
             account_owners,
             include_transactions: false,
+            transaction_signers: Vec::new(),
         }
     }
 
@@ -113,6 +120,18 @@ impl SubscriptionRequest {
             account_pubkeys: Vec::new(),
             account_owners: Vec::new(),
             include_transactions: true,
+            transaction_signers: Vec::new(),
+        }
+    }
+
+    /// Subscribe to transactions where any of `signers` is a signer.
+    pub fn transactions_signed_by(signers: Vec<Pubkey>) -> Self {
+        Self {
+            slot_token: None,
+            account_pubkeys: Vec::new(),
+            account_owners: Vec::new(),
+            include_transactions: false,
+            transaction_signers: signers,
         }
     }
 
@@ -123,6 +142,11 @@ impl SubscriptionRequest {
 
     pub fn with_transactions(mut self) -> Self {
         self.include_transactions = true;
+        self
+    }
+
+    pub fn with_transaction_signers(mut self, signers: Vec<Pubkey>) -> Self {
+        self.transaction_signers = signers;
         self
     }
 
@@ -140,6 +164,11 @@ impl SubscriptionRequest {
             account_pubkeys: self.account_pubkeys.iter().map(|k| k.to_bytes()).collect(),
             account_owners: self.account_owners.iter().map(|k| k.to_bytes()).collect(),
             include_transactions: self.include_transactions,
+            transaction_signers: self
+                .transaction_signers
+                .iter()
+                .map(|k| k.to_bytes())
+                .collect(),
         };
         serialize_wire!(wire)
     }
@@ -165,6 +194,11 @@ impl SubscriptionRequest {
                 .map(Pubkey::new_from_array)
                 .collect(),
             include_transactions: wire.include_transactions,
+            transaction_signers: wire
+                .transaction_signers
+                .into_iter()
+                .map(Pubkey::new_from_array)
+                .collect(),
         })
     }
 }
@@ -779,6 +813,10 @@ pub struct TransactionUpdate {
     pub index: u32,
     pub signature: [u8; 64],
     pub is_vote: bool,
+    /// Required signers of the transaction (the first
+    /// `num_required_signatures` static account keys, fee payer first).
+    /// Producers must fill this for signer-filtered subscriptions to match.
+    pub signers: Vec<Pubkey>,
     pub payload: TransactionPayload,
 }
 
@@ -795,8 +833,15 @@ impl TransactionUpdate {
             index,
             signature,
             is_vote,
+            signers: Vec::new(),
             payload: TransactionPayload::new(payload)?,
         })
+    }
+
+    /// Attach the transaction's signer keys (fee payer first).
+    pub fn with_signers(mut self, signers: Vec<Pubkey>) -> Self {
+        self.signers = signers;
+        self
     }
 
     pub fn encode_parts_at(
@@ -809,6 +854,11 @@ impl TransactionUpdate {
                 max: MAX_TRANSACTION_PAYLOAD_BYTES,
             });
         }
+        if self.signers.len() > MAX_TRANSACTION_SIGNERS {
+            return Err(QlasterError::MalformedPayload(
+                "transaction update has too many signers",
+            ));
+        }
         let payload = self.payload.clone_bytes();
         let payload_len_u32: u32 =
             payload
@@ -819,7 +869,8 @@ impl TransactionUpdate {
                     max: MAX_TRANSACTION_PAYLOAD_BYTES,
                 })?;
 
-        let mut header = Vec::with_capacity(TRANSACTION_UPDATE_FIXED_BYTES);
+        let mut header =
+            Vec::with_capacity(TRANSACTION_UPDATE_FIXED_BYTES + 32 * self.signers.len());
         header.push(WIRE_VERSION);
         header.push(TRANSACTION_UPDATE_TAG);
         header.extend_from_slice(&sender_created_at_unix_nanos.to_le_bytes());
@@ -827,6 +878,10 @@ impl TransactionUpdate {
         header.extend_from_slice(&self.index.to_le_bytes());
         header.push(u8::from(self.is_vote));
         header.extend_from_slice(&self.signature);
+        header.push(self.signers.len() as u8);
+        for signer in &self.signers {
+            header.extend_from_slice(signer.as_ref());
+        }
         header.extend_from_slice(&payload_len_u32.to_le_bytes());
         Ok((Bytes::from(header), payload))
     }
@@ -879,6 +934,11 @@ impl TransactionUpdate {
                 index: decoded.index,
                 signature: decoded.signature,
                 is_vote: decoded.is_vote,
+                signers: decoded
+                    .signers
+                    .into_iter()
+                    .map(Pubkey::new_from_array)
+                    .collect(),
                 payload: TransactionPayload::from_bytes(payload)?,
             },
             AccountUpdateWireMeta {
@@ -969,13 +1029,14 @@ impl DecodedAccountUpdate {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct DecodedTransactionUpdate {
     sender_created_at_unix_nanos: u64,
     slot: u64,
     index: u32,
     is_vote: bool,
     signature: [u8; 64],
+    signers: Vec<[u8; 32]>,
     payload_offset: usize,
     payload_len: usize,
 }
@@ -1004,6 +1065,16 @@ impl DecodedTransactionUpdate {
             }
         };
         let signature = take_array_64(bytes, &mut cursor)?;
+        let signer_count = take_u8(bytes, &mut cursor)? as usize;
+        if signer_count > MAX_TRANSACTION_SIGNERS {
+            return Err(QlasterError::MalformedPayload(
+                "transaction update has too many signers",
+            ));
+        }
+        let mut signers = Vec::with_capacity(signer_count);
+        for _ in 0..signer_count {
+            signers.push(take_array_32(bytes, &mut cursor)?);
+        }
         let payload_len = take_u32_le(bytes, &mut cursor)? as usize;
         if payload_len > MAX_TRANSACTION_PAYLOAD_BYTES {
             return Err(QlasterError::PayloadTooLarge {
@@ -1023,6 +1094,7 @@ impl DecodedTransactionUpdate {
             index,
             is_vote,
             signature,
+            signers,
             payload_offset: cursor,
             payload_len,
         })
@@ -1121,6 +1193,7 @@ struct WireSubscriptionRequest {
     account_pubkeys: Vec<[u8; 32]>,
     account_owners: Vec<[u8; 32]>,
     include_transactions: bool,
+    transaction_signers: Vec<[u8; 32]>,
 }
 
 #[derive(Clone, Debug, SchemaWrite, SchemaRead)]
@@ -1161,6 +1234,7 @@ mod tests {
             vec![Pubkey::new_unique()],
         )
         .with_transactions()
+        .with_transaction_signers(vec![Pubkey::new_unique()])
         .with_slot_token(Some(SlotToken::new(2, 42)));
         let bytes = req.encode();
         let decoded = SubscriptionRequest::decode(&bytes).expect("decode request");
@@ -1265,6 +1339,7 @@ mod tests {
             index: 4,
             signature: [7u8; 64],
             is_vote: true,
+            signers: vec![Pubkey::new_unique(), Pubkey::new_unique()],
             payload: TransactionPayload::from_slice(b"transaction bytes").expect("payload"),
         };
         let sender_created_at_unix_nanos = 987_654_321;
