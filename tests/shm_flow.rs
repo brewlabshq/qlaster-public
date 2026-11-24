@@ -245,6 +245,7 @@ async fn shm_transaction_stream_requires_subscription() {
         index: 3,
         signature: [9u8; 64],
         is_vote: false,
+        signers: vec![test_pubkey(42)],
         payload: TransactionPayload::from_slice(b"tx-bytes").expect("payload"),
     };
 
@@ -303,6 +304,152 @@ async fn shm_transaction_stream_requires_subscription() {
         full_read_snap.count >= 1 && full_read_snap.total_us > 0,
         "consumer full_read metric should cover transaction sender-to-queue latency, got {full_read_snap:?}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shm_transaction_signer_filter_delivers_only_signed() {
+    let cfg = shm_config("tx-signers");
+    let uds_path = cfg.uds_path.clone();
+
+    let (updates_tx, _) = broadcast::channel::<AccountUpdate>(128);
+    let (transactions_tx, _) = broadcast::channel::<TransactionUpdate>(128);
+    let metrics = Arc::new(QlasterSenderMetrics::new());
+
+    let sender = setup_sender_with_transactions(
+        SenderConfig { shm: cfg },
+        updates_tx.clone(),
+        Some(transactions_tx.clone()),
+        None,
+        Arc::clone(&metrics),
+    )
+    .await
+    .expect("setup sender");
+    let _sender_task = tokio::spawn(sender.run());
+
+    let wallet = test_pubkey(1);
+    let fee_payer = test_pubkey(2);
+    let stranger = test_pubkey(3);
+
+    let mut wallet_consumer = setup_shm_consumer(&uds_path)
+        .await
+        .expect("setup wallet consumer");
+    wallet_consumer
+        .subscribe_transactions_signed_by(vec![wallet])
+        .await
+        .expect("signer subscribe");
+
+    let mut all_consumer = setup_shm_consumer(&uds_path)
+        .await
+        .expect("setup all-tx consumer");
+    all_consumer
+        .subscribe_transactions()
+        .await
+        .expect("all-tx subscribe");
+
+    let tx = |index: u32, signers: Vec<Pubkey>| {
+        TransactionUpdate::new(
+            9,
+            index,
+            [index as u8; 64],
+            false,
+            bytes::Bytes::from_static(b"tx-bytes"),
+        )
+        .expect("tx")
+        .with_signers(signers)
+    };
+
+    // Not signed by the wallet: only the all-tx consumer sees it.
+    let _ = transactions_tx.send(tx(0, vec![stranger]));
+    // Wallet as a secondary signer (someone else pays fees): must match.
+    let _ = transactions_tx.send(tx(1, vec![fee_payer, wallet]));
+    // Wallet as fee payer: must match.
+    let _ = transactions_tx.send(tx(2, vec![wallet]));
+
+    let mut wallet_got = Vec::new();
+    for _ in 0..2 {
+        let got = drain_one_transaction(
+            || wallet_consumer.try_next_transaction(),
+            Duration::from_secs(3),
+        )
+        .await
+        .expect("wallet transaction timeout");
+        assert!(got.signers.contains(&wallet), "unsigned tx leaked: {got:?}");
+        wallet_got.push(got.index);
+    }
+    assert_eq!(wallet_got, vec![1, 2]);
+    assert!(
+        drain_one_transaction(
+            || wallet_consumer.try_next_transaction(),
+            Duration::from_millis(300)
+        )
+        .await
+        .is_none(),
+        "wallet consumer received a transaction it did not sign"
+    );
+
+    let mut all_got = Vec::new();
+    for _ in 0..3 {
+        let got = drain_one_transaction(
+            || all_consumer.try_next_transaction(),
+            Duration::from_secs(3),
+        )
+        .await
+        .expect("all-tx timeout");
+        all_got.push(got.index);
+    }
+    assert_eq!(all_got, vec![0, 1, 2]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sender_interest_tracks_subscriptions() {
+    let cfg = shm_config("interest");
+    let uds_path = cfg.uds_path.clone();
+
+    let (updates_tx, _) = broadcast::channel::<AccountUpdate>(128);
+    let (transactions_tx, _) = broadcast::channel::<TransactionUpdate>(128);
+    let sender = setup_sender_with_transactions(
+        SenderConfig { shm: cfg },
+        updates_tx.clone(),
+        Some(transactions_tx.clone()),
+        None,
+        Arc::new(QlasterSenderMetrics::new()),
+    )
+    .await
+    .expect("setup sender");
+    let interest = sender.interest();
+    let _sender_task = tokio::spawn(sender.run());
+
+    let wallet = test_pubkey(11);
+    let account = test_pubkey(12);
+    let owner = test_pubkey(13);
+    let other = test_pubkey(14);
+
+    assert!(!interest.has_consumers());
+    assert!(!interest.wants_transactions());
+    assert!(!interest.wants_account(&account, &owner));
+
+    let mut consumer = setup_shm_consumer(&uds_path).await.expect("setup consumer");
+    consumer
+        .subscribe_transactions_signed_by(vec![wallet])
+        .await
+        .expect("signer subscribe");
+    consumer
+        .subscribe(vec![account], Vec::new())
+        .await
+        .expect("account subscribe");
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !(interest.wants_transactions() && interest.wants_account(&account, &other)) {
+        assert!(
+            Instant::now() < deadline,
+            "interest never reflected subscriptions"
+        );
+        tokio::task::yield_now().await;
+    }
+    assert!(interest.has_consumers());
+    assert!(interest.wants_transaction_signed_by(&[other, wallet]));
+    assert!(!interest.wants_transaction_signed_by(&[other]));
+    assert!(!interest.wants_account(&other, &owner));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

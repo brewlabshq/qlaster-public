@@ -132,6 +132,18 @@ impl QlasterShmConsumer {
         self.send_subscription(request).await
     }
 
+    /// Receive only transactions where any of `signers` is a required signer
+    /// (fee payer included). Filtering happens in the sender, so unmatched
+    /// transactions never reach this consumer's ring. Calls accumulate.
+    pub async fn subscribe_transactions_signed_by(
+        &mut self,
+        signers: Vec<solana_pubkey::Pubkey>,
+    ) -> Result<(), QlasterError> {
+        let request =
+            SubscriptionRequest::transactions_signed_by(signers).with_slot_token(self.slot_token());
+        self.send_subscription(request).await
+    }
+
     async fn send_subscription(
         &mut self,
         request: SubscriptionRequest,

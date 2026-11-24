@@ -49,6 +49,23 @@ consumer.subscribe(vec![pubkey], vec![]).await?;
 while let Some(update) = consumer.updates.pop() { /* ... */ }
 ```
 
+### Transactions by signer
+
+A consumer can ask for only the transactions a given wallet signed (as fee
+payer or any other required signer):
+
+```rust
+consumer.subscribe_transactions_signed_by(vec![wallet]).await?;
+while let Some(tx) = consumer.try_next_transaction() { /* tx.signers contains wallet */ }
+```
+
+Filtering happens in the sender through an inverted `signer -> consumer slots`
+index, so each transaction costs one hash lookup per signer regardless of how
+many consumers are connected, and nothing is encoded when no consumer matches.
+The producer must populate `TransactionUpdate::signers` (the first
+`num_required_signatures` static account keys) via `with_signers`; updates
+without signers only reach `subscribe_transactions()` consumers.
+
 See `tests/shm_flow.rs` for end-to-end examples (account filtering, transaction
 opt-in, always-on slot updates, reconnection).
 
